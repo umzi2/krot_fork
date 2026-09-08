@@ -98,6 +98,16 @@ impl Connection {
             }
         }
     }
+
+    /// Best-effort remote IP of the underlying connection.
+    /// `None` when the transport does not expose a peer address.
+    #[must_use]
+    pub fn remote_ip(&self) -> Option<std::net::IpAddr> {
+        match &self.inner {
+            ConnectionInner::Quic(c) => Some(c.remote_address().ip()),
+            ConnectionInner::TcpMux(_) => None,
+        }
+    }
 }
 
 /// Bidirectional-stream send half.

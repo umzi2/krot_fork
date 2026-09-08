@@ -1,9 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# Production Dockerfile for `krot-server` — targets Docker Hub.
+# Production Dockerfile for `krot-server` — fully static musl build on
+# a `scratch` runtime (no libc, no shell, no package manager).
 #
 # Build (single-arch, host):
 #   docker build -t krottunnel/krot-server:dev .
+#
+# The build is fully OFFLINE: all crate dependencies are vendored in
+# `vendor/` (regenerate with `cargo vendor`), and the `rust:1-alpine`
+# builder image ships the complete musl toolchain so no apk access is
+# needed. This also makes the build hermetic and reproducible.
 #
 # Build multi-arch and push (uses buildx, requires a Docker Hub login):
 #   docker buildx build \
@@ -14,18 +20,11 @@
 #     -t krottunnel/krot-server:latest \
 #     -t krottunnel/krot-server:0.1.0 \
 #     --push .
-#
 # The `.github/workflows/docker.yml` job does all of the above
 # automatically on every `v*.*.*` tag push.
 
 # ---------- builder ----------
-FROM --platform=$BUILDPLATFORM rust:1.83-slim-bookworm AS builder
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      pkg-config \
-      ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+FROM --platform=$BUILDPLATFORM rust:1-alpine AS builder
 
 WORKDIR /src
 
@@ -33,19 +32,38 @@ WORKDIR /src
 # BuildKit reuses the dependency layer whenever only sources change.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
+# vendor/ ships as a single tar: many small files COPY unreliably from
+# network/FUSE-mounted workspaces; one archive transfers atomically.
+COPY vendor.tar /tmp/vendor.tar
+RUN tar xf /tmp/vendor.tar -C /src && rm /tmp/vendor.tar
 
-# Cache Cargo registry + target/ across builds. This is the big
-# CI-friendly win: cold builds still take a few minutes, warm ones
-# take seconds.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin krot-server \
- && cp target/release/krot-server /usr/local/bin/krot-server \
+# Offline build against vendored sources, statically linked with musl
+# (cc in rust:alpine IS musl-gcc, so no extra packages are needed).
+# RUSTUP_TOOLCHAIN pins the image's preinstalled toolchain: rustup
+# would otherwise try to download `stable` per rust-toolchain.toml.
+RUN printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/src/vendor"\n' \
+        > /usr/local/cargo/config.toml \
+ && CARGO_NET_OFFLINE=true \
+    RUSTUP_TOOLCHAIN=1.98.0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+    RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --release --locked --target x86_64-unknown-linux-musl --bin krot-server \
+ && cp target/x86_64-unknown-linux-musl/release/krot-server /usr/local/bin/krot-server \
  && strip /usr/local/bin/krot-server
+
+# CA root store for Let's Encrypt (ACME) — copied into the scratch image.
+# Also stage the unprivileged state + config dirs so they exist in the
+# empty runtime filesystem (no shell in scratch to mkdir).
+RUN mkdir -p /out/etc/ssl/certs /out/var/lib/krot /out/etc/krot \
+ && cp /etc/ssl/certs/ca-certificates.crt /out/etc/ssl/certs/ \
+ && touch /out/etc/krot/authorized_keys /out/var/lib/krot/.keep \
+ && chown -R 1000:1000 /out/var/lib/krot /out/etc/krot \
+ && chmod 0755 /out/var/lib/krot /out/etc/krot \
+ && chmod 0644 /out/etc/krot/authorized_keys
 
 
 # ---------- runtime ----------
-FROM debian:bookworm-slim AS runtime
+FROM scratch AS runtime
 
 # Metadata plumbing.
 ARG VERSION="0.0.0-dev"
@@ -55,7 +73,7 @@ ARG BUILD_DATE="1970-01-01T00:00:00Z"
 # OCI image labels — Docker Hub renders these in the image sidebar.
 # See https://github.com/opencontainers/image-spec/blob/main/annotations.md
 LABEL org.opencontainers.image.title="krot-server" \
-      org.opencontainers.image.description="Self-hosted tunnel service (QUIC + TLS fallback), Rust, thread-per-core." \
+      org.opencontainers.image.description="Self-hosted tunnel service (QUIC + TLS fallback), Rust, thread-per-core. Static musl build on scratch." \
       org.opencontainers.image.url="https://github.com/krottunnel/krot" \
       org.opencontainers.image.source="https://github.com/krottunnel/krot" \
       org.opencontainers.image.documentation="https://github.com/krottunnel/krot#readme" \
@@ -65,33 +83,19 @@ LABEL org.opencontainers.image.title="krot-server" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
-# `ca-certificates` is required by instant-acme for Let's Encrypt.
-# `tini` forwards SIGTERM to krot-server so `docker stop` triggers
-# the graceful-shutdown path.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      ca-certificates \
-      tini \
- && rm -rf /var/lib/apt/lists/*
-
-# Unprivileged runtime user. UID/GID 1000 for easy host bind-mount
-# ownership on typical single-user Linux hosts.
-RUN groupadd --system --gid 1000 krot \
- && useradd  --system --uid 1000 --gid 1000 \
-             --home-dir /var/lib/krot --shell /usr/sbin/nologin krot
-
+# Static binary + CA bundle + pre-created state/config dirs.
 COPY --from=builder /usr/local/bin/krot-server /usr/local/bin/krot-server
+COPY --from=builder /out/etc /etc
+# Copy the parent `var` tree wholesale: a dest dir Docker creates
+# itself would be root-owned and an empty anonymous VOLUME would then
+# mount root-owned, breaking the unprivileged runtime user.
+COPY --from=builder /out/var /var
 
-# Prepare state + config directories with correct ownership BEFORE
-# declaring them as VOLUMEs so first-boot defaults still apply on an
-# empty host bind mount.
-RUN mkdir -p /var/lib/krot /etc/krot \
- && chown krot:krot /var/lib/krot /etc/krot \
- && touch /etc/krot/authorized_keys \
- && chown krot:krot /etc/krot/authorized_keys \
- && chmod 0600     /etc/krot/authorized_keys
-
-USER krot
+# Unprivileged runtime user (numeric — no /etc/passwd in scratch).
+# UID/GID 1000 for easy host bind-mount ownership on typical
+# single-user Linux hosts. krot-server is PID-1-safe: it is a tokio
+# binary that traps SIGTERM itself, so no tini is needed.
+USER 1000:1000
 
 # Persistent state (identity cert, ACME account + cert cache,
 # admin_token.hash).
@@ -113,7 +117,7 @@ EXPOSE 7580/tcp
 # it at deploy time using the admin API's authenticated /metrics
 # scrape as a proxy for liveness.
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/krot-server"]
+ENTRYPOINT ["/usr/local/bin/krot-server"]
 
 # IpMode by default. Override with --domain, --tls-cert, --tls-key or
 # --acme-contact at `docker run` time.

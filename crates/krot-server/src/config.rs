@@ -89,6 +89,14 @@ pub struct ServerConfig {
     pub mode: Mode,
     /// If true, always print a fresh admin token at startup.
     pub issue_admin_token: bool,
+    /// If true, admin tokens stay valid until they expire instead of
+    /// being consumed by the first enrollment.
+    pub admin_token_reusable: bool,
+    /// Admin token time-to-live in seconds; `0` disables expiry.
+    pub admin_token_ttl_secs: u64,
+    /// Max concurrent HTTP tunnels (domains) per client IP. `usize::MAX`
+    /// disables the cap; deployments usually want `1`.
+    pub max_http_tunnels_per_ip: usize,
     /// §16.4: TCP bind for the structured admin API. `None` disables
     /// the endpoint. Default is loopback-only (`127.0.0.1:9700`);
     /// operators exposing it publicly are expected to front it with a
@@ -130,6 +138,9 @@ impl ServerConfig {
             data_dir,
             mode: Mode::default(),
             issue_admin_token: false,
+            admin_token_reusable: false,
+            admin_token_ttl_secs: 600,
+            max_http_tunnels_per_ip: usize::MAX,
             // Tests bind the admin API on an ephemeral loopback port so
             // they can drive it without colliding on 9700 across parallel
             // runs.
@@ -156,6 +167,18 @@ impl ServerConfig {
     #[must_use]
     pub fn with_issue_admin_token(mut self, issue: bool) -> Self {
         self.issue_admin_token = issue;
+        self
+    }
+
+    #[must_use]
+    pub fn with_admin_token_reusable(mut self, reusable: bool) -> Self {
+        self.admin_token_reusable = reusable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_admin_token_ttl_secs(mut self, secs: u64) -> Self {
+        self.admin_token_ttl_secs = secs;
         self
     }
 

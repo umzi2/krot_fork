@@ -102,6 +102,10 @@ pub struct Session {
     /// Process-wide metrics. `Session` bumps counters for register /
     /// resume outcomes; the aggregate is scraped at `/admin/v1/metrics`.
     pub metrics: Arc<ServerMetrics>,
+    /// Public IP of the client (QUIC peer). `None` for transports that
+    /// do not expose it (TCP-mux fallback). Used for the per-IP HTTP
+    /// tunnel cap.
+    pub client_ip: Option<std::net::IpAddr>,
 }
 
 impl Session {
@@ -487,6 +491,21 @@ impl Session {
             return Ok(());
         };
 
+        // Per-IP cap: one client address, at most N HTTP (sub)domains.
+        if !self.registry.admits_http_for_ip(self.client_ip) {
+            self.registry.abort_http(tunnel_id, label);
+            self.metrics.tunnel_rejected_label.fetch_add(1, MRelax);
+            write_frame(
+                send,
+                &ServerFrame::TunnelRejected {
+                    code: ErrorCode::LABEL_FORBIDDEN,
+                    detail: "client IP already holds the maximum number of domains".into(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
         self.registry.insert(TunnelInfo {
             id: tunnel_id,
             owner: self.pubkey,
@@ -498,6 +517,7 @@ impl Session {
                 connection: self.connection.clone(),
                 abort: None,
             },
+            client_ip: self.client_ip,
             tcp_listener: None,
             rate: Arc::clone(&self.rate),
             inspect,
@@ -607,6 +627,7 @@ impl Session {
             tcp_listener: Some(listener),
             rate: Arc::clone(&self.rate),
             inspect,
+            client_ip: self.client_ip,
         });
         self.metrics.tunnel_registered_tcp.fetch_add(1, MRelax);
 

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
+    OrderStatus, RetryPolicy,
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -29,7 +29,6 @@ use tracing::{info, warn};
 use crate::error::ServerError;
 
 const POLL_ATTEMPTS: usize = 60;
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `token → key_authorization` map that the HTTP-01 responder consults.
 pub type ChallengeStore = Arc<RwLock<HashMap<String, String>>>;
@@ -78,52 +77,42 @@ pub async fn acquire_cert(
 
     let identifier = Identifier::Dns(apex.to_string());
     let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &[identifier],
-        })
+        .new_order(&NewOrder::new(&[identifier]))
         .await
         .map_err(|e| ServerError::Keys(format!("new_order: {e}")))?;
 
-    let authorizations = order
-        .authorizations()
+    // §12.1: iterate authorizations, provision the http-01 response in
+    // the shared challenge store, then mark each challenge ready.
+    {
+        let mut authzs = order.authorizations();
+        while let Some(authz) = authzs.next().await {
+            let mut authz = authz.map_err(|e| ServerError::Keys(format!("authorizations: {e}")))?;
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
+                .ok_or_else(|| ServerError::Keys("no http-01 challenge offered".into()))?;
+            let key_auth = challenge.key_authorization();
+            challenges
+                .write()
+                .unwrap()
+                .insert(challenge.token.clone(), key_auth.as_str().to_string());
+            challenge
+                .set_ready()
+                .await
+                .map_err(|e| ServerError::Keys(format!("set_challenge_ready: {e}")))?;
+    }
+    }
+    let status = order
+        .poll_ready(
+            &RetryPolicy::new()
+                .initial_delay(Duration::from_millis(500))
+                .backoff(2.0)
+                .timeout(Duration::from_secs(POLL_ATTEMPTS as u64)),
+        )
         .await
-        .map_err(|e| ServerError::Keys(format!("authorizations: {e}")))?;
-
-    let mut challenge_urls = Vec::new();
-    for authz in &authorizations {
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
-            .ok_or_else(|| ServerError::Keys("no http-01 challenge offered".into()))?;
-        let key_auth = order.key_authorization(challenge);
-        challenges
-            .write()
-            .unwrap()
-            .insert(challenge.token.clone(), key_auth.as_str().to_string());
-        challenge_urls.push(challenge.url.clone());
+        .map_err(|e| ServerError::Keys(format!("order not ready: {e}")))?;
+    if status != OrderStatus::Ready {
+        return Err(ServerError::Keys("acme order invalid".into()));
     }
-    for url in &challenge_urls {
-        order
-            .set_challenge_ready(url)
-            .await
-            .map_err(|e| ServerError::Keys(format!("set_challenge_ready: {e}")))?;
-    }
-
-    for _ in 0..POLL_ATTEMPTS {
-        let state = order
-            .refresh()
-            .await
-            .map_err(|e| ServerError::Keys(format!("refresh: {e}")))?;
-        match state.status {
-            OrderStatus::Ready => break,
-            OrderStatus::Invalid => {
-                return Err(ServerError::Keys("acme order invalid".into()));
-            }
-            _ => tokio::time::sleep(POLL_INTERVAL).await,
-        }
-    }
-
     let cert_key = KeyPair::generate().map_err(ServerError::Rcgen)?;
     let mut params = CertificateParams::new(vec![apex.to_string()]).map_err(ServerError::Rcgen)?;
     let mut dn = DistinguishedName::new();
@@ -134,7 +123,7 @@ pub async fn acquire_cert(
         .map_err(ServerError::Rcgen)?;
 
     order
-        .finalize(csr.der())
+        .finalize_csr(csr.der())
         .await
         .map_err(|e| ServerError::Keys(format!("finalize: {e}")))?;
 
@@ -174,23 +163,27 @@ async fn load_or_create_account(
         let text = fs::read_to_string(&creds_path)?;
         let creds: AccountCredentials = serde_json::from_str(&text)
             .map_err(|e| ServerError::Keys(format!("bad account.json: {e}")))?;
-        return Account::from_credentials(creds)
+        return Account::builder()
+            .map_err(|e| ServerError::Keys(format!("account builder: {e}")))?
+            .from_credentials(creds)
             .await
             .map_err(|e| ServerError::Keys(format!("account restore: {e}")));
     }
     let contact_owned = contact.to_string();
     let contacts: Vec<&str> = vec![contact_owned.as_str()];
-    let (account, creds) = Account::create(
-        &NewAccount {
-            contact: &contacts,
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        directory,
-        None,
-    )
-    .await
-    .map_err(|e| ServerError::Keys(format!("account create: {e}")))?;
+    let (account, creds) = Account::builder()
+        .map_err(|e| ServerError::Keys(format!("account builder: {e}")))?
+        .create(
+            &NewAccount {
+                contact: &contacts,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory.to_string(),
+            None,
+        )
+        .await
+        .map_err(|e| ServerError::Keys(format!("account create: {e}")))?;
 
     let text = serde_json::to_string_pretty(&creds)
         .map_err(|e| ServerError::Keys(format!("serialize creds: {e}")))?;

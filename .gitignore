@@ -41,3 +41,15 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# =============================================================
+# Deploy tooling: contains server address + credentials. NEVER push.
+# =============================================================
+/scripts/
+
+# =============================================================
+# Vendored crates + tarball for offline docker builds (regenerate:
+# cargo vendor vendor && tar -cf vendor.tar vendor). Too big for git.
+# =============================================================
+/vendor/
+/vendor.tar

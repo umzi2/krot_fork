@@ -139,9 +139,15 @@ impl Server {
         // §16.3.2 static peer list. Same hot-reload pattern as keys.
         let peers = Arc::new(PeerRegistry::open(config.peer_list_path.clone())?);
         drop(Arc::clone(&peers).spawn_watcher());
-        let admin = Arc::new(AdminTokenStore::new(config.data_dir.clone()));
+        let admin = Arc::new(
+            AdminTokenStore::new(config.data_dir.clone())
+                .with_reusable(config.admin_token_reusable)
+                .with_ttl(Duration::from_secs(config.admin_token_ttl_secs)),
+        );
         let port_pool = config.mode.tcp_port_pool();
-        let registry = Arc::new(TunnelRegistry::new(port_pool));
+        let registry = Arc::new(
+            TunnelRegistry::new(port_pool).with_max_http_per_ip(config.max_http_tunnels_per_ip),
+        );
         // §7.3 reaper: drop dangling tunnels whose grace deadline has
         // passed. Runs for the lifetime of the runtime; explicit
         // shutdown is out of scope since exit destroys the runtime.
@@ -757,6 +763,7 @@ async fn handle_connection(
                 peers: Arc::clone(&shared.peers),
                 peer_lookup: Arc::clone(&shared.peer_lookup.lock().unwrap()),
                 metrics: Arc::clone(&shared.metrics),
+                client_ip: connection.remote_ip(),
             };
             let result = session.run(&mut send, &mut recv).await;
             rate_state.detach_ctrl();

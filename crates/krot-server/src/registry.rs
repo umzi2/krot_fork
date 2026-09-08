@@ -8,6 +8,7 @@
 //! the new connection, preserving both `tunnel_id` and public URL.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -49,6 +50,10 @@ pub struct TunnelInfo {
     /// first byte of tunneled payload. Set from `RegisterTunnel.inspect`
     /// at registration time; preserved across §7.3 resume.
     pub inspect: bool,
+    /// Public IP of the client that registered the tunnel. `None` for
+    /// transports that do not expose a peer address. Used to enforce
+    /// the per-IP HTTP tunnel cap.
+    pub client_ip: Option<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -75,6 +80,8 @@ pub enum TunnelState {
 #[derive(Debug)]
 pub struct TunnelRegistry {
     port_pool: RangeInclusive<u16>,
+    /// Max concurrent HTTP tunnels per client IP. `usize::MAX` = unlimited.
+    max_http_per_ip: usize,
     state: Mutex<State>,
 }
 
@@ -149,6 +156,7 @@ impl TunnelRegistry {
     pub fn new(port_pool: RangeInclusive<u16>) -> Self {
         Self {
             port_pool,
+            max_http_per_ip: usize::MAX,
             state: Mutex::new(State {
                 next_id: 1,
                 used_ports: HashSet::new(),
@@ -159,8 +167,40 @@ impl TunnelRegistry {
         }
     }
 
-    /// Allocate a fresh `(TunnelId, port)` pair for a TCP tunnel.
-    ///
+    /// Cap the number of concurrent HTTP tunnels a single client IP
+    /// may hold (default: unlimited).
+    #[must_use]
+    pub fn with_max_http_per_ip(mut self, max: usize) -> Self {
+        self.max_http_per_ip = max.max(1);
+        self
+    }
+
+    /// Whether a client from `ip` may register one more HTTP tunnel.
+    #[must_use]
+    pub fn admits_http_for_ip(&self, ip: Option<IpAddr>) -> bool {
+        if self.max_http_per_ip == usize::MAX {
+            return true;
+        }
+        let Some(ip) = ip else {
+            return true; // transport without peer address: not attributable
+        };
+        let state = self.state.lock().unwrap();
+        state
+            .tunnels
+            .values()
+            .filter(|t| t.client_ip == Some(ip) && matches!(t.kind, RegisteredKind::Http { .. }))
+            .count()
+            < self.max_http_per_ip
+    }
+
+    /// Release a label reserved by [`Self::allocate_http`] without
+    /// ever inserting the tunnel (registration rejected afterwards).
+    pub fn abort_http(&self, id: TunnelId, label: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.used_labels.remove(label);
+        state.labels.remove(label);
+        let _ = id;
+    }
     /// `allowlist`, when `Some`, further narrows the pool: only ports
     /// that appear in it are eligible. Used to enforce §13 `ports=`.
     pub fn allocate_tcp(&self, allowlist: Option<&[u16]>) -> Result<(TunnelId, u16), ServerError> {
@@ -495,7 +535,7 @@ pub fn is_valid_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use krot_proto::SESSION_ID_LEN;
     #[test]
     fn label_grammar() {
         assert!(is_valid_label("alice"));
@@ -510,5 +550,36 @@ mod tests {
         assert!(!is_valid_label("al ice"));
         assert!(!is_valid_label("admin"));
         assert!(!is_valid_label(&"a".repeat(64)));
+    }
+
+    fn http_info(id: TunnelId, ip: Option<IpAddr>) -> TunnelInfo {
+        TunnelInfo {
+            id,
+            owner: PubKey([0u8; 32]),
+            session_id: SessionId([0u8; SESSION_ID_LEN]),
+            kind: RegisteredKind::Http {
+                label: format!("label{id:?}"),
+            },
+            state: TunnelState::Dangling {
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+            tcp_listener: None,
+            rate: Arc::new(RateLimitState::from_entry(None, None, 1)),
+            inspect: false,
+            client_ip: ip,
+        }
+    }
+
+    #[test]
+    fn per_ip_http_cap() {
+        let reg = TunnelRegistry::new(10_000..=10_001).with_max_http_per_ip(1);
+        let ip = Some(IpAddr::from([1, 2, 3, 4]));
+        assert!(reg.admits_http_for_ip(ip));
+        reg.insert(http_info(TunnelId(1), ip));
+        assert!(!reg.admits_http_for_ip(ip)); // cap reached
+        let other = Some(IpAddr::from([5, 6, 7, 8]));
+        assert!(reg.admits_http_for_ip(other)); // different IP unaffected
+        reg.remove(TunnelId(1));
+        assert!(reg.admits_http_for_ip(ip));
     }
 }

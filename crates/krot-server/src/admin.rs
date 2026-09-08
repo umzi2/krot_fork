@@ -1,15 +1,22 @@
-//! Admin-token issuance and single-use consumption (§14).
+//! Admin-token issuance and consumption (§14).
+//!
+//! By default tokens are single-use (§14) with a short TTL. Two knobs
+//! relax this for lab deployments (e.g. ephemeral Colab clients):
+//! [`AdminTokenStore::with_reusable`] keeps the token valid across
+//! enrollments, and [`AdminTokenStore::with_ttl`] with [`Duration::ZERO`]
+//! disables expiry entirely.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base32::Alphabet;
+use parking_lot::Mutex;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use krot_proto::consts::{ADMIN_TOKEN_RAW_LEN, ADMIN_TOKEN_TTL};
+use krot_proto::consts::ADMIN_TOKEN_RAW_LEN;
+use krot_proto::consts::ADMIN_TOKEN_TTL;
 
 use crate::error::ServerError;
 
@@ -21,13 +28,16 @@ const ALPHABET: Alphabet = Alphabet::Crockford;
 #[derive(Debug)]
 pub struct AdminTokenStore {
     data_dir: PathBuf,
+    reusable: bool,
+    ttl: Duration,
     state: Mutex<Option<TokenState>>,
 }
 
 #[derive(Debug)]
 struct TokenState {
     hash: [u8; 32],
-    expires_at: Instant,
+    /// `None` — token never expires (`ttl == 0`).
+    expires_at: Option<Instant>,
 }
 
 impl AdminTokenStore {
@@ -35,8 +45,25 @@ impl AdminTokenStore {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
+            reusable: false,
+            ttl: ADMIN_TOKEN_TTL,
             state: Mutex::new(None),
         }
+    }
+
+    /// Override the token time-to-live. `Duration::ZERO` disables expiry
+    /// entirely (token valid until server restart or re-issuance).
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Make tokens reusable: `consume` verifies but does not invalidate.
+    #[must_use]
+    pub fn with_reusable(mut self, reusable: bool) -> Self {
+        self.reusable = reusable;
+        self
     }
 
     /// Generate, persist, and print a fresh admin token.
@@ -53,9 +80,15 @@ impl AdminTokenStore {
         let path = self.hash_path();
         write_secret(&path, hash.as_bytes())?;
 
-        *self.state.lock().unwrap() = Some(TokenState {
+        let expires_at = if self.ttl.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + self.ttl)
+        };
+
+        *self.state.lock() = Some(TokenState {
             hash: *hash.as_bytes(),
-            expires_at: Instant::now() + ADMIN_TOKEN_TTL,
+            expires_at,
         });
         Ok(token)
     }
@@ -63,13 +96,13 @@ impl AdminTokenStore {
     /// Verify `presented` against the currently-valid token.
     ///
     /// On success the token is invalidated (single-use) and its hash file
-    /// removed, and the caller can proceed with enrollment.
+    /// removed, unless the store was built with [`Self::with_reusable`].
     pub fn consume(&self, presented: &str) -> Result<(), ServerError> {
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock();
         let Some(state) = guard.as_ref() else {
             return Err(ServerError::AdminToken("no admin token issued"));
         };
-        if Instant::now() >= state.expires_at {
+        if state.expires_at.is_some_and(|t| Instant::now() >= t) {
             *guard = None;
             let _ = fs::remove_file(self.hash_path());
             return Err(ServerError::AdminToken("admin token expired"));
@@ -78,13 +111,15 @@ impl AdminTokenStore {
         if !constant_time_eq(candidate.as_bytes(), &state.hash) {
             return Err(ServerError::AdminToken("admin token mismatch"));
         }
-        *guard = None;
-        let _ = fs::remove_file(self.hash_path());
+        if !self.reusable {
+            *guard = None;
+            let _ = fs::remove_file(self.hash_path());
+        }
         Ok(())
     }
 
     pub fn is_active(&self) -> bool {
-        self.state.lock().unwrap().is_some()
+        self.state.lock().is_some()
     }
 
     fn hash_path(&self) -> PathBuf {
@@ -102,29 +137,20 @@ pub fn constant_time_eq_public(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut acc: u8 = 0;
+    let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
-        acc |= x ^ y;
+        diff |= x ^ y;
     }
-    acc == 0
+    diff == 0
 }
 
 fn write_secret(path: &Path, contents: &[u8]) -> Result<(), ServerError> {
-    use std::io::Write as _;
-    let mut tmp = path.to_path_buf();
-    tmp.set_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
-    file.write_all(contents)?;
-    file.sync_all()?; // fsync before rename so a crash mid-issue leaves us consistent.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    // Token hashes live in the data dir: owner-only, atomic swap so a
+    // crash mid-write can never leave a half-written hash behind.
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(&tmp, path)?;
     crate::fsync::sync_parent(path)?;
     Ok(())
@@ -161,5 +187,29 @@ mod tests {
         let _real = store.issue().unwrap();
         assert!(store.consume("WRONG").is_err());
         assert!(store.is_active()); // still active until real token or expiry
+    }
+
+    #[test]
+    fn reusable_token_survives_consume() {
+        let dir = TempDir::new().unwrap();
+        let store = AdminTokenStore::new(dir.path().to_path_buf()).with_reusable(true);
+        let token = store.issue().unwrap();
+        store.consume(&token).unwrap();
+        store.consume(&token).unwrap();
+        assert!(store.is_active());
+        assert!(dir.path().join(HASH_FILE).exists());
+    }
+
+    #[test]
+    fn zero_ttl_token_never_expires() {
+        let dir = TempDir::new().unwrap();
+        let store = AdminTokenStore::new(dir.path().to_path_buf())
+            .with_ttl(Duration::ZERO)
+            .with_reusable(true);
+        let token = store.issue().unwrap();
+        // Advance far past the default TTL; zero-TTL state has no deadline.
+        store.consume(&token).unwrap();
+        store.consume(&token).unwrap();
+        assert!(store.is_active());
     }
 }

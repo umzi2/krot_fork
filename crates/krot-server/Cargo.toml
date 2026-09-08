@@ -25,6 +25,7 @@ path = "src/lib.rs"
 [dependencies]
 krot-proto     = { workspace = true }
 krot-transport = { workspace = true }
+parking_lot     = { workspace = true }
 tokio          = { workspace = true }
 quinn          = { workspace = true }
 rustls         = { workspace = true }

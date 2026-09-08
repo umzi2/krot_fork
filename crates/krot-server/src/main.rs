@@ -71,6 +71,21 @@ struct Args {
     #[arg(long)]
     issue_admin_token: bool,
 
+    /// Keep admin tokens valid until they expire instead of consuming
+    /// them on first enrollment.
+    #[arg(long)]
+    admin_token_reusable: bool,
+
+    /// Admin token time-to-live in seconds. `0` disables expiry — the
+    /// token stays valid until the server restarts (handy for ephemeral
+    /// clients that re-enroll on every boot).
+    #[arg(long, default_value_t = 600)]
+    admin_token_ttl_secs: u64,
+
+    /// Max HTTP tunnels (domains) a single client IP may hold at once.
+    #[arg(long, default_value_t = 1)]
+    max_http_tunnels_per_ip: usize,
+
     /// §16.4: TCP bind for the structured admin API. Pass an empty value
     /// (`--admin-bind ""`) to disable the endpoint. Default is loopback
     /// only. Operators exposing this publicly are expected to front it
@@ -228,6 +243,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         authorized_keys_path: args.authorized_keys,
         mode,
         issue_admin_token: args.issue_admin_token,
+        admin_token_reusable: args.admin_token_reusable,
+        admin_token_ttl_secs: args.admin_token_ttl_secs,
+        max_http_tunnels_per_ip: args.max_http_tunnels_per_ip,
         admin_bind: args.admin_bind,
         admin_session_ttl: krot_server::admin_api::DEFAULT_SESSION_TTL,
         peer_list_path: args.peer_list,
@@ -243,14 +261,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Ctrl+C handler on the startup runtime.
+    // Ctrl+C / SIGTERM handler on the startup runtime. SIGTERM must be
+    // handled explicitly: as a container PID 1, default dispositions are
+    // ignored, so `docker stop` would otherwise never shut us down
+    // gracefully (tini can't help on a scratch image).
     {
         let tx = shutdown_tx.clone();
         startup_rt.handle().spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("received Ctrl+C, initiating graceful shutdown");
-                let _ = tx.send(true);
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
             }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            tracing::info!("received shutdown signal, initiating graceful shutdown");
+            let _ = tx.send(true);
         });
     }
 
