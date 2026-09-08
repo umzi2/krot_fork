@@ -21,6 +21,8 @@ use krot_proto::consts::ADMIN_TOKEN_TTL;
 use crate::error::ServerError;
 
 const HASH_FILE: &str = "admin_token.hash";
+/// Raw token, persisted so the same token survives server restarts.
+const TOKEN_FILE: &str = "admin_token";
 /// Crockford base32, unpadded — matches §14.1.
 const ALPHABET: Alphabet = Alphabet::Crockford;
 
@@ -66,19 +68,38 @@ impl AdminTokenStore {
         self
     }
 
-    /// Generate, persist, and print a fresh admin token.
-    ///
-    /// The returned string is the token in its user-facing form and should
-    /// be exposed to the operator (typically via stdout).
+    /// Return the admin token, minting and persisting one only if no
+    /// valid token exists yet. A persisted token is reloaded on every
+    /// call and every server start, so it never changes and never gets
+    /// consumed unless the operator deletes `admin_token`.
     pub fn issue(&self) -> Result<String, ServerError> {
+        // Reload a persisted token: the same token across restarts.
+        let token_path = self.token_path();
+        if let Ok(text) = fs::read_to_string(&token_path) {
+            let token = text.trim().to_string();
+            if !token.is_empty() {
+                let hash = blake3::hash(token.as_bytes());
+                let expires_at = if self.ttl.is_zero() {
+                    None
+                } else {
+                    Some(Instant::now() + self.ttl)
+                };
+                *self.state.lock() = Some(TokenState {
+                    hash: *hash.as_bytes(),
+                    expires_at,
+                });
+                return Ok(token);
+            }
+        }
+
         let mut raw = [0u8; ADMIN_TOKEN_RAW_LEN];
         OsRng.fill_bytes(&mut raw);
         let token = base32::encode(ALPHABET, &raw);
         let hash = blake3::hash(token.as_bytes());
 
         fs::create_dir_all(&self.data_dir)?;
-        let path = self.hash_path();
-        write_secret(&path, hash.as_bytes())?;
+        write_secret(&token_path, token.as_bytes())?;
+        write_secret(&self.hash_path(), hash.as_bytes())?;
 
         let expires_at = if self.ttl.is_zero() {
             None
@@ -105,6 +126,7 @@ impl AdminTokenStore {
         if state.expires_at.is_some_and(|t| Instant::now() >= t) {
             *guard = None;
             let _ = fs::remove_file(self.hash_path());
+            let _ = fs::remove_file(self.token_path());
             return Err(ServerError::AdminToken("admin token expired"));
         }
         let candidate = blake3::hash(presented.as_bytes());
@@ -114,6 +136,7 @@ impl AdminTokenStore {
         if !self.reusable {
             *guard = None;
             let _ = fs::remove_file(self.hash_path());
+            let _ = fs::remove_file(self.token_path());
         }
         Ok(())
     }
@@ -124,6 +147,10 @@ impl AdminTokenStore {
 
     fn hash_path(&self) -> PathBuf {
         self.data_dir.join(HASH_FILE)
+    }
+
+    fn token_path(&self) -> PathBuf {
+        self.data_dir.join(TOKEN_FILE)
     }
 }
 
@@ -211,5 +238,20 @@ mod tests {
         store.consume(&token).unwrap();
         store.consume(&token).unwrap();
         assert!(store.is_active());
+    }
+
+    #[test]
+    fn token_survives_store_recreation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let token = AdminTokenStore::new(path.clone())
+            .with_reusable(true)
+            .issue()
+            .unwrap();
+        // Simulate a server restart: a brand-new store over the same
+        // data dir must serve the SAME token, not mint a new one.
+        let restarted = AdminTokenStore::new(path).with_reusable(true);
+        assert_eq!(restarted.issue().unwrap(), token);
+        restarted.consume(&token).unwrap();
     }
 }
